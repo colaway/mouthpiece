@@ -1,0 +1,109 @@
+# Mouthpiece configuration — the single source of truth for all phases.
+# Paths are relative to the repo root unless absolute.
+
+capture:
+  camera_index: 0
+  fps: 25            # must match the VSR model's training frame rate
+  width: 640
+  height: 480
+
+preprocess:
+  # Auto-AVSR mouth ROI, matching its retinaface/68-landmark training preprocessing.
+  face_landmarker_model: models/preprocess/face_landmarker.task
+  mean_face: models/preprocess/20words_mean_face.npy
+  stable_points: [28, 33, 36, 39, 42, 45, 48, 54]   # dlib-68 indices used for alignment
+  aligned_size: 256        # face warped to this square using a mean-face reference
+  roi_size: 96             # mouth crop cut from the aligned face
+  model_input_size: 88     # center crop fed to the model
+  grayscale: true
+  normalize_mean: 0.421
+  normalize_std: 0.165
+  smoothing_window: 12     # frames used for temporal landmark smoothing (centered, offline)
+  live_smoothing_window: 6 # causal window for the live preview
+
+model:
+  name: auto_avsr_vsr      # Auto-AVSR LRS3_V_WER19.1 (mpc001/Visual_Speech_Recognition_for_Multiple_Languages)
+  device: auto             # auto | mps | cpu
+  checkpoint: models/vsr/model.pth
+  model_config: models/vsr/model.json
+  # SentencePiece unigram5000 (LRS3). Token ids: 0 <blank>, 1..5047 from the units file,
+  # 5048 <sos/eos> -> 5049 outputs, matching ctc.ctc_lo in the checkpoint.
+  tokenizer: models/vsr/unigram5000.model
+  tokenizer_units: models/vsr/unigram5000_units.txt
+  language_model: models/lm/model.pth   # optional; set to null (or lm_weight 0) to skip
+  language_model_config: models/lm/model.json
+  # Fine-tuned weights from `mouthpiece train` (Phase 4). `current` is a symlink to the last
+  # run that beat the pretrained model on the val split; it is used instead of `checkpoint`
+  # when it exists. null (or --pretrained on the CLI) forces the pretrained weights.
+  finetuned: models/finetuned/current
+
+decode:
+  # Joint CTC/attention beam search, Auto-AVSR defaults:
+  # score = (1 - ctc_weight) * decoder + ctc_weight * ctc + lm_weight * lm + length_bonus * len
+  beam_size: 40
+  ctc_weight: 0.1
+  lm_weight: 0.3
+  length_bonus: 0.0
+  top_k: 3                 # hypotheses returned/printed
+
+data:
+  personal_dir: data/personal
+  manifest: data/personal/manifest.jsonl
+
+record:
+  # `mouthpiece record`: built-in command phrases + dictation sentences, plus this file
+  # (one phrase per line, `#` comments) if set.
+  prompts: null
+  count: 100               # takes to keep per session
+  takes_per_phrase: 5      # a phrase stops being prompted once it has this many takes
+  min_frames: 13           # reject takes shorter than ~0.5 s ...
+  max_frames: 250          # ... or longer than 10 s
+  min_detection_rate: 0.9  # reject takes where the face was missed in >10% of frames
+  save_video: true         # keep full-frame video.mp4 next to mouth.npy
+  baseline: true           # transcribe each take with the current model, store hypothesis
+  val_fraction: 0.1        # deterministic train/val split by clip id
+
+train:
+  # `mouthpiece train`: fine-tune on data/personal. Frozen: video frontend, embed and the lower
+  # Conformer blocks. Trained: the top `trainable_blocks` blocks, after_norm, decoder, CTC head.
+  output_dir: models/finetuned   # each run -> <output_dir>/<timestamp>/{best.pth,metrics.json,config.yaml}
+  trainable_blocks: 4
+  epochs: 10
+  lr: 1.0e-4               # AdamW, linear warmup then cosine decay
+  weight_decay: 0.01
+  warmup_fraction: 0.1
+  max_batch_frames: 800    # padded frames per batch (batch size * longest clip)
+  grad_clip: 5.0
+  ctc_weight: 0.1          # loss = ctc_weight * CTC + (1 - ctc_weight) * attention CE
+  label_smoothing: 0.1
+  patience: 3              # early stopping on val WER
+  min_clips: 100           # refuse a real run with fewer clips unless --force
+  eval_beam_size: null     # null = decode.beam_size (val WER is decoded like inference)
+  random_crop: true        # augmentation (train only): random 88 crop from the 96 ROI,
+  hflip_prob: 0.5          # horizontal flip,
+  time_mask_window: 10     # and up to 10 masked frames per 25
+  time_mask_stride: 25
+  seed: 0
+
+app:
+  # `mouthpiece app`: menu-bar app. Hold the hotkey while mouthing, release to transcribe.
+  # right_option | left_option | right_command | right_control | right_shift | fn | f13..f19
+  hotkey: right_option
+  mode: command            # command (closed set of command phrases) | dictation (free text)
+  min_hold_s: 0.3          # shorter presses are ignored, so a plain tap of the key still works
+  max_hold_s: 15.0         # longer holds stop and transcribe automatically
+  picker_timeout_s: 2.0    # top-3 picker accepts #1 after this many seconds; 0 = always wait
+  dictation_picker: false  # false: dictation types the best guess the moment you release the key
+  commands: null           # extra command phrases file (one per line), added to the built-ins
+
+typing:
+  # `mouthpiece app` output. Dictation is typed into the focused app with casing and spacing;
+  # command phrases become keys/actions (see src/mouthpiece/typing/actions.py). Needs
+  # Accessibility permission for the app running Python.
+  enabled: true            # false: only print what was recognised
+  method: auto             # auto (key events; paste for long text / paste_apps) | keys | paste
+  paste_over_chars: 200
+  paste_apps: []           # bundle ids that ignore synthetic typing, e.g. com.microsoft.rdc.macos
+  clipboard_restore_s: 0.5 # the old clipboard comes back this long after a paste
+  key_delay_ms: 2.0        # pause after each posted event
+  history: 20              # how many typed chunks "scratch that" can remove in a row
